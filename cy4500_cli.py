@@ -51,7 +51,7 @@ except ImportError as exc:
     ) from exc
 
 try:
-    from ezpd_protocol_v10 import (
+    from ezpd_protocol import (
         USB_VID_CYPRESS,
         USB_PID_CY4500_EPR,
         USB_INTERFACE,
@@ -114,7 +114,7 @@ try:
     )
 except ImportError as exc:
     raise SystemExit(
-        "ezpd_protocol_v10.py must be in the same directory or on PYTHONPATH."
+        "ezpd_protocol.py must be in the same directory or on PYTHONPATH."
     ) from exc
 
 
@@ -347,7 +347,7 @@ class CY4500EPR:
         """
         Build and send CMD_TRIGGER.
 
-        Conditions use ezpd_protocol_v10.build_trigger_packet(), e.g.:
+        Conditions use ezpd_protocol.build_trigger_packet(), e.g.:
             msg_class="DATA", msg_type="EPR_REQUEST"
         """
         packet = build_trigger_packet(**conditions)
@@ -739,13 +739,13 @@ class CaptureSemanticTracker:
     """
     Stateful semantic layer over pure 64-byte record decoding.
 
-    It intentionally lives in the controller rather than ezpd_protocol_v10:
+    It intentionally lives in the controller rather than ezpd_protocol:
       * remembers the latest SOURCE_CAPABILITIES for later REQUEST decoding
       * reassembles EPR_SOURCE_CAPABILITIES chunks
       * measures EPR KeepAlive cadence
       * summarizes request / voltage transitions
 
-    Pure bitfield/packet decoders remain in ezpd_protocol_v10.py.
+    Pure bitfield/packet decoders remain in ezpd_protocol.py.
     """
 
     def __init__(self) -> None:

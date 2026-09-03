@@ -1,3 +1,13 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# Local development history, measurements, and investigation notes.
+/archive/
+/captures/
+/notes/
+
+# Default output files when commands run from the repository root.
+/cy4500_capture.*
+/cy4500_scope.csv
+/cy4500_sync_analysis.*
