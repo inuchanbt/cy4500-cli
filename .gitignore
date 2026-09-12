@@ -11,3 +11,7 @@ __pycache__/
 /cy4500_capture.*
 /cy4500_scope.csv
 /cy4500_sync_analysis.*
+
+# Private capture fixtures (kept locally, never published).
+/tests/sample.records.bin
+/tests/sample.utility.csv

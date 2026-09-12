@@ -64,6 +64,32 @@ For continuous capture, stop with **Ctrl+C**:
 
 Output directories are created automatically. Use a new prefix for each session: existing output files with the same names are overwritten. Use a prefix without a file extension, because output suffixes replace any existing extension.
 
+### Export Analyzer Utility CSV and ccgx3
+
+CSV now uses the Analyzer Utility format by default. Add `--ccgx3` to capture:
+
+```powershell
+.\.venv\Scripts\python.exe cy4500_cli.py capture --seconds 10 --scope --ccgx3 --out-prefix captures/session01
+```
+
+- `.csv` uses Utility-style values: sequential row numbers, textual status, integer millivolts under the original `Vbus(V)` heading, and hexadecimal header/data fields. Sno is sequential, including voltage events. Original hardware values remain in `.records.bin` and `.records.jsonl`.
+- `.ccgx3` is a ZIP containing Java-serialized `USBPacketData` and `GraphData` lists. With `--scope`, it includes captured waveform samples; otherwise the waveform list is empty. No Java installation is needed to export.
+- Output is finalized when capture ends, including Ctrl+C. Temporary packet and scope data are spooled to disk during capture.
+
+Convert an existing CLI capture without hardware (PD packets only):
+
+```powershell
+.\.venv\Scripts\python.exe cy4500_cli.py export-gui --records captures/session01.records.bin --out-prefix captures/converted01
+```
+
+This writes both `.csv` and `.ccgx3`. The input must be a CLI file of fixed 64-byte records, not `.xfers.bin` or a GUI ccgx3 file. Existing outputs with the same prefix are overwritten.
+
+Compatibility was checked against the supplied September 12, 2026 Utility capture: all 38 CSV rows match, including extended messages, and the installed Utility 4.2 Java classes deserialize the generated packets and waveform data. CSV and ccgx3 from a fresh hardware capture were also verified to open normally in the GUI. This exports raw packets and table values; it does not reproduce user annotations or GUI session settings.
+
+Analysis accepts both old CLI and Utility CSV formats, converting voltage units and payload encoding. `--gui-csv` is now a no-op compatibility alias and creates no second CSV. `--csv-bug-compatible` has been removed.
+
+Regression tests use artificial packets; captured measurement files are not included in the repository. Run regression checks with `python -m unittest discover -s tests -v`. The Java helpers in `tests` are optional interoperability checks and require a JDK plus the installed Utility's plugins on the classpath.
+
 ### Read live status
 
 Read 20 samples, 100 ms apart, and save them to CSV:
@@ -139,6 +165,7 @@ Append `--help` to any command for its options.
 | `version` | Read analyzer firmware version |
 | `live-status` / `volt-amp` | Poll VBUS, IBUS, CC1, and CC2 |
 | `capture` | Capture USB-PD records, optionally with scope telemetry |
+| `export-gui` | Convert saved `.records.bin` to Utility CSV and ccgx3 without hardware (PD only) |
 | `scope` | Record scope telemetry while draining PD traffic |
 | `analyze-sync` | Analyze saved PD and scope CSV files |
 | `trigger` | Configure, inspect, clear, or arm hardware trigger criteria |
@@ -155,6 +182,7 @@ For `--out-prefix captures/session01`, the following suffixes are added to `capt
 | Suffix | Contents | Created when |
 | --- | --- | --- |
 | `.csv` | Decoded PD records in Analyzer Utility CSV schema | `capture` |
+| `.ccgx3` | GUI session file; includes waveform samples when `--scope` is enabled | `capture --ccgx3` |
 | `.records.jsonl` | Decoded records with semantic details | `capture` |
 | `.records.bin` | Concatenated raw 64-byte PD records | `capture` |
 | `.records.hex.txt` | Hexadecimal PD record dump | `capture` |
@@ -165,7 +193,7 @@ For `--out-prefix captures/session01`, the following suffixes are added to `capt
 | `.transitions.csv` / `.transitions.txt` | Detailed AVS transition analysis | Scope capture with analysis, or `analyze-sync` |
 | `.transition_summary.csv` / `.transition_summary.txt` | Compact per-transition summary | Scope capture with analysis, or `analyze-sync` |
 
-CSV files use UTF-8 with a BOM for convenient opening in spreadsheet applications. By default, PD CSV end times reflect the decoded record. `--csv-bug-compatible` reproduces Analyzer Utility 4.2.0's behavior where End Time duplicates Start Time.
+PD CSV uses UTF-8 and the Utility format. Scope and analysis CSV files use UTF-8 with a BOM. PD end times reflect the actual captured end time.
 
 ## Repository layout
 

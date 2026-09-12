@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from utility_export import UtilityExport
 import statistics
 from collections import Counter
 import json
@@ -1862,10 +1863,23 @@ def _load_pd_capture_csv(path: Path) -> list[SyncPDSample]:
             if start_us is None or end_us is None:
                 continue
             data_text = (row.get("Data") or "").strip()
+            utility_format = (row.get("Ok") or "").strip() not in ("0", "1")
+            voltage = _optional_float(row.get("Vbus(V)"))
             try:
-                data = bytes.fromhex(data_text) if data_text else b""
-            except ValueError:
+                if utility_format and data_text:
+                    words = data_text.split()
+                    header = int(words[0], 16)
+                    if header & 0x8000:
+                        data = int(words[1], 16).to_bytes(2, 'little')
+                        data += bytes(int(word, 16) for word in words[2:])
+                    else:
+                        data = b''.join(int(word, 16).to_bytes(4, 'little') for word in words[1:])
+                else:
+                    data = bytes.fromhex(data_text) if data_text else b""
+            except (ValueError, IndexError, OverflowError):
                 data = b""
+            if utility_format and voltage is not None:
+                voltage /= 1000
             rows.append(
                 SyncPDSample(
                     row_index=row_index,
@@ -1873,7 +1887,7 @@ def _load_pd_capture_csv(path: Path) -> list[SyncPDSample]:
                     message=(row.get("Message") or "").strip(),
                     start_us=start_us,
                     end_us=end_us,
-                    vbus_V=_optional_float(row.get("Vbus(V)")),
+                    vbus_V=voltage,
                     data=data,
                 )
             )
@@ -2549,6 +2563,30 @@ def _cmd_scope(args) -> int:
 
     return 0
 
+def _cmd_export_gui(args) -> int:
+    source = Path(args.records)
+    prefix = Path(args.out_prefix)
+    if source.stat().st_size % 64:
+        raise ValueError('records input must contain complete 64-byte EP81 records')
+    csv_path = prefix.with_suffix('.csv')
+    ccgx3_path = prefix.with_suffix('.ccgx3')
+    if source.resolve() in (csv_path.resolve(), ccgx3_path.resolve()):
+        raise ValueError('output must not overwrite input')
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    export = UtilityExport(csv_path, ccgx3_path)
+    try:
+        with source.open('rb') as fp:
+            index = 0
+            while raw := fp.read(64):
+                index += 1
+                export.write_record(CaptureRecord(index, raw, {}))
+    finally:
+        export.close()
+    print(f"GUI CSV : {csv_path.resolve()}")
+    print(f"CCGX3   : {ccgx3_path.resolve()}")
+    return 0
+
+
 def _cmd_capture(args) -> int:
     prefix = Path(args.out_prefix)
 
@@ -2578,11 +2616,14 @@ def _cmd_capture(args) -> int:
     for path in output_paths:
         path.parent.mkdir(parents=True, exist_ok=True)
 
+    utility_export = UtilityExport(
+        csv_path,
+        prefix.with_suffix('.ccgx3') if args.ccgx3 else None,
+    )
     xfers_f = xfers_path.open("wb")
     records_f = records_path.open("wb")
     hex_f = hex_path.open("w", encoding="utf-8", newline="\n")
     jsonl_f = jsonl_path.open("w", encoding="utf-8", newline="\n")
-    csv_f = csv_path.open("w", encoding="utf-8-sig", newline="")
 
     scope_csv_f = (
         scope_csv_path.open("w", encoding="utf-8-sig", newline="")
@@ -2593,10 +2634,6 @@ def _cmd_capture(args) -> int:
         if args.scope and args.scope_raw else None
     )
 
-    csv_export = AnalyzerSchemaCSV(
-        csv_f,
-        bug_compatible_end_time=args.csv_bug_compatible,
-    )
     scope_export = ScopeCSV(scope_csv_f) if scope_csv_f is not None else None
     semantic_tracker = CaptureSemanticTracker()
 
@@ -2635,7 +2672,7 @@ def _cmd_capture(args) -> int:
             "decoded": _jsonable(record.decoded),
         }
         jsonl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        csv_export.write_record(record)
+        utility_export.write_record(record)
 
         if not args.quiet:
             print(_compact_record(record))
@@ -2654,6 +2691,7 @@ def _cmd_capture(args) -> int:
 
     def on_scope_sample(transfer_index: int, sample: ScopeSample) -> None:
         nonlocal ep83_first_raw, ep83_first_us, ep83_last_raw, ep83_last_us
+        utility_export.write_scope(sample)
 
         if ep83_first_us is None:
             ep83_first_raw = sample.timestamp_raw
@@ -2721,11 +2759,11 @@ def _cmd_capture(args) -> int:
         records_f.close()
         hex_f.close()
         jsonl_f.close()
-        csv_f.close()
         if scope_csv_f is not None:
             scope_csv_f.close()
         if scope_raw_f is not None:
             scope_raw_f.close()
+        utility_export.close()
 
     if stats is None:
         raise CY4500Error("capture ended before statistics were available")
@@ -2785,16 +2823,15 @@ def _cmd_capture(args) -> int:
     print(f"Hex text  : {hex_path.resolve()}")
     print(f"JSONL     : {jsonl_path.resolve()}")
     print(f"CSV       : {csv_path.resolve()}")
+    if args.ccgx3:
+        print(f"CCGX3     : {prefix.with_suffix('.ccgx3').resolve()}")
     if args.scope:
         print(f"Scope CSV : {scope_csv_path.resolve()}")
         if args.scope_raw:
             print(f"Scope raw : {scope_raw_path.resolve()}")
     print(f"Summary   : {summary_path.resolve()}")
 
-    if args.csv_bug_compatible:
-        print("CSV mode  : Analyzer Utility 4.2.0 End Time bug reproduced")
-    else:
-        print("CSV mode  : corrected End Time; time fields are microseconds")
+    print("CSV mode  : Utility format; sequential Sno; time fields are microseconds")
 
     if args.scope:
         print(
@@ -2946,6 +2983,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Direct CY4500-EPR controller/capture utility"
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser('export-gui', help='convert saved .records.bin to Utility CSV and ccgx3 (PD only)',
+                       description='Convert fixed 64-byte CLI records to .csv and .ccgx3 without hardware. Existing outputs are overwritten. Waveforms are not included.')
+    p.add_argument('--records', required=True, help='CLI .records.bin input')
+    p.add_argument('--out-prefix', required=True, help='output prefix for .csv and .ccgx3')
+    p.set_defaults(func=_cmd_export_gui)
+
 
     p = sub.add_parser(
         "usb-info",
@@ -3042,7 +3085,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "capture",
-        help="capture EP81 USB-PD records",
+        help="capture EP81 USB-PD records with Utility-format CSV",
+        description=("Capture USB-PD records to Utility-format .csv, JSONL and raw files. "
+                     "CSV Sno is sequential and Vbus(V) contains integer millivolts. "
+                     "Add --ccgx3 for a GUI session file and --scope to include waveforms."),
     )
 
     duration = p.add_mutually_exclusive_group()
@@ -3092,14 +3138,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="count malformed EP81 data transfers instead of aborting",
     )
-    p.add_argument(
-        "--csv-bug-compatible",
-        action="store_true",
-        help=(
-            "reproduce Analyzer Utility 4.2.0 CSV bug where "
-            "End Time duplicates Start Time"
-        ),
-    )
+    p.add_argument('--gui-csv', action='store_true',
+                   help='compatibility alias; Utility CSV is now the default')
+    p.add_argument('--ccgx3', action='store_true',
+                   help='also export Utility 4.2 session ZIP (.ccgx3); includes scope when --scope is used')
     p.set_defaults(func=_cmd_capture)
 
     p = sub.add_parser(
