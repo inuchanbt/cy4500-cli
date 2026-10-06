@@ -1106,7 +1106,9 @@ def analyze_avs_transitions(
       - noise = MAD around baseline
       - threshold = max(min_threshold, MAD * multiplier)
       - movement starts at the first sustained run of N samples beyond that
-        threshold in the request direction.
+        threshold; direction follows the measured sign, independent of nominal
+        target offset. Without a sustained run the target-based fallback is
+        explicitly flagged.
 
     Absolute settling:
       - target band is ±target_band_fraction of the requested target voltage.
@@ -1216,22 +1218,23 @@ def analyze_avs_transitions(
         sustain = max(1, int(movement_sustain_samples))
 
         if baseline_v is not None and movement_threshold is not None:
-            def moved(s: SyncScopeSample) -> bool:
-                if direction == "up":
-                    return s.vbus_V >= baseline_v + movement_threshold
-                if direction == "down":
-                    return s.vbus_V <= baseline_v - movement_threshold
-                return False
-
             for n in range(0, max(0, len(post_scope) - sustain + 1)):
                 window = post_scope[n:n + sustain]
-                if all(moved(s) for s in window):
+                if not all(0 < b.timestamp_us-a.timestamp_us <= settle_max_sample_gap_us for a,b in zip(window,window[1:])):
+                    continue
+                up = all(s.vbus_V >= baseline_v + movement_threshold for s in window)
+                down = all(s.vbus_V <= baseline_v - movement_threshold for s in window)
+                if up or down:
+                    # Nominal target vs measured baseline can reverse the sign
+                    # when voltage offset exceeds the requested sweep step.
+                    direction = "up" if up else "down"
                     movement_sample = window[0]
                     movement_start = movement_sample.timestamp_us
                     break
 
         if movement_start is None:
             flags.append("movement_not_detected")
+            flags.append("direction_from_target_fallback")
 
         band_abs = abs(target_v) * float(target_band_fraction)
         band_lo = target_v - band_abs
@@ -1239,13 +1242,19 @@ def analyze_avs_transitions(
 
         crossing_sample = None
         band_first = None
+        before_request = [s for s in scope if s.timestamp_us < req.start_us]
+        previous_v = before_request[-1].vbus_V if before_request else baseline_v
+        if previous_v is not None and ((direction == "up" and previous_v >= target_v)
+                or (direction == "down" and previous_v <= target_v)):
+            flags.append("target_already_beyond_at_request")
         for s in post_scope:
-            if crossing_sample is None:
+            if crossing_sample is None and previous_v is not None:
                 if (
-                    (direction == "up" and s.vbus_V >= target_v)
-                    or (direction == "down" and s.vbus_V <= target_v)
+                    (direction == "up" and previous_v < target_v <= s.vbus_V)
+                    or (direction == "down" and previous_v > target_v >= s.vbus_V)
                 ):
                     crossing_sample = s
+            previous_v = s.vbus_V
             if band_first is None and band_lo <= s.vbus_V <= band_hi:
                 band_first = s
             if crossing_sample is not None and band_first is not None:
@@ -1476,6 +1485,18 @@ def analyze_avs_transitions(
                 (band_first.vbus_V - movement_sample.vbus_V)
                 / ((band_first.timestamp_us - movement_sample.timestamp_us) / 1e6)
             )
+
+        # These endpoints may capture overshoot recovery, not the ramp. Never
+        # present an opposite-sign recovery rate as this transition's slew.
+        sign = 1 if direction == "up" else -1 if direction == "down" else 0
+        if observed_average_slew is not None and observed_average_slew * sign < 0:
+            observed_average_slew = None
+            flags.append("observed_slew_opposes_movement")
+        if average_slew is not None and average_slew * sign < 0:
+            average_slew = None
+            flags.append("absolute_slew_opposes_movement")
+        if movement_sample is not None and observed_band_first is not None and observed_band_first.timestamp_us <= movement_sample.timestamp_us:
+            flags.append("observed_slew_unresolved")
 
         results.append(
             AVSTransitionAnalysis(

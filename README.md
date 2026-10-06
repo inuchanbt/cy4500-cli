@@ -118,6 +118,8 @@ Re-run AVS analysis without opening the analyzer:
 
 Use PD and scope CSV files from the same session. Analysis reports the requested target voltage and the observed final plateau separately, including whether the requested target band was reached. A trace can settle around an observed plateau without reaching the requested voltage band.
 
+Movement direction follows the first sustained measured voltage change, rather than nominal target minus measured baseline. This handles a downward sweep whose voltage offset exceeds its requested step. An unobserved movement retains the nominal direction with `direction_from_target_fallback`. Already being beyond the target is flagged as `target_already_beyond_at_request`, not a target crossing at zero time. A slew with a sign opposing the measured movement is omitted and flagged (`observed_slew_opposes_movement` / `absolute_slew_opposes_movement`); this can otherwise report overshoot recovery as ramp speed. `observed_slew_unresolved` marks endpoints observed at the same sample. Raw PD/scope and settling results remain unchanged. The October 6 test08 regression confirms 34 upward and 33 downward AVS movements, correcting 28 descending requests previously marked upward.
+
 Existing analysis outputs cause the command to stop; add `--force` to overwrite them. A capture prefix can be reused here if it has no analysis outputs yet.
 
 Use `analyze-sync --help` for baseline, movement, settling, and plateau thresholds. The USB library must still be installed because it is imported when the CLI starts.
