@@ -2413,10 +2413,46 @@ def _print_transition_analysis(analyses: list[AVSTransitionAnalysis]) -> None:
         )
 
 
+TRANSITION_OUTPUT_SUFFIXES = (
+    ".transitions.csv",
+    ".transitions.txt",
+    ".transition_summary.csv",
+    ".transition_summary.txt",
+)
+
+CAPTURE_OUTPUT_SUFFIXES = (
+    ".xfers.bin",
+    ".records.bin",
+    ".records.hex.txt",
+    ".records.jsonl",
+    ".csv",
+    ".summary.txt",
+    ".ccgx3",
+    ".scope.csv",
+    ".scope.xfers.bin",
+) + TRANSITION_OUTPUT_SUFFIXES
+
+
+def _check_output_paths(paths, *, force: bool) -> None:
+    if force:
+        return
+    existing = [str(path.resolve()) for path in paths if path.exists()]
+    if existing:
+        raise ValueError(
+            "output already exists; choose a new --out-prefix or use --force "
+            "to overwrite:\n  " + "\n  ".join(existing)
+        )
+
+
 def _cmd_analyze_sync(args) -> int:
     pd_csv = Path(args.pd_csv)
     scope_csv = Path(args.scope_csv)
     prefix = Path(args.out_prefix)
+
+    _check_output_paths(
+        [prefix.with_suffix(suffix) for suffix in TRANSITION_OUTPUT_SUFFIXES],
+        force=args.force,
+    )
 
     analyses = _run_sync_analysis(
         pd_csv,
@@ -2572,6 +2608,7 @@ def _cmd_export_gui(args) -> int:
     ccgx3_path = prefix.with_suffix('.ccgx3')
     if source.resolve() in (csv_path.resolve(), ccgx3_path.resolve()):
         raise ValueError('output must not overwrite input')
+    _check_output_paths([csv_path, ccgx3_path], force=args.force)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     export = UtilityExport(csv_path, ccgx3_path)
     try:
@@ -2589,6 +2626,15 @@ def _cmd_export_gui(args) -> int:
 
 def _cmd_capture(args) -> int:
     prefix = Path(args.out_prefix)
+
+    if args.analyze_transitions and not args.scope:
+        raise ValueError("--analyze-transitions requires --scope")
+    # Reserve the whole session prefix, including optional outputs from a
+    # previous capture, before opening files or accessing the analyzer.
+    _check_output_paths(
+        [prefix.with_suffix(suffix) for suffix in CAPTURE_OUTPUT_SUFFIXES],
+        force=args.force,
+    )
 
     xfers_path = prefix.with_suffix(".xfers.bin")
     records_path = prefix.with_suffix(".records.bin")
@@ -2674,7 +2720,9 @@ def _cmd_capture(args) -> int:
         jsonl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
         utility_export.write_record(record)
 
-        if not args.quiet:
+        if not args.quiet and not (
+            args.hide_goodcrc and record.decoded.get("message_name") == "GOODCRC"
+        ):
             print(_compact_record(record))
             for detail in detail_lines:
                 print("    -> " + detail)
@@ -2843,7 +2891,7 @@ def _cmd_capture(args) -> int:
     for line in semantic_summary:
         print(line)
 
-    if args.scope and not args.no_analyze_transitions:
+    if args.analyze_transitions:
         analyses = _run_sync_analysis(
             csv_path,
             scope_csv_path,
@@ -2984,9 +3032,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser('export-gui', help='convert saved .records.bin to Utility CSV and ccgx3 (PD only)',
-                       description='Convert fixed 64-byte CLI records to .csv and .ccgx3 without hardware. Existing outputs are overwritten. Waveforms are not included.')
+                       description='Convert fixed 64-byte CLI records to .csv and .ccgx3 without hardware. Use --force to overwrite existing outputs. Waveforms are not included.')
     p.add_argument('--records', required=True, help='CLI .records.bin input')
     p.add_argument('--out-prefix', required=True, help='output prefix for .csv and .ccgx3')
+    p.add_argument('--force', action='store_true', help='overwrite existing output files')
     p.set_defaults(func=_cmd_export_gui)
 
 
@@ -3044,6 +3093,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="cy4500_sync_analysis",
         help="output prefix for .transitions.csv/.transitions.txt",
     )
+    p.add_argument('--force', action='store_true', help='overwrite existing output files')
     _add_transition_analysis_options(p)
     p.set_defaults(func=_cmd_analyze_sync)
 
@@ -3109,6 +3159,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="cy4500_capture",
         help="output path prefix (default: cy4500_capture)",
     )
+    p.add_argument('--force', action='store_true', help='overwrite existing output files')
     p.add_argument(
         "--scope",
         action="store_true",
@@ -3123,11 +3174,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="with --scope, also save length-prefixed raw EP83 transfers",
     )
     p.add_argument(
-        "--no-analyze-transitions",
+        "--analyze-transitions",
         action="store_true",
-        help="disable automatic EP81+EP83 AVS transition analysis",
+        help="run EP81+EP83 AVS transition analysis after capture (requires --scope)",
     )
     _add_transition_analysis_options(p)
+    p.add_argument(
+        "--hide-goodcrc",
+        action="store_true",
+        help="suppress GOODCRC console lines while preserving all saved records",
+    )
     p.add_argument(
         "--quiet",
         action="store_true",
