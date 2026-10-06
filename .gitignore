@@ -15,3 +15,6 @@ __pycache__/
 # Private capture fixtures (kept locally, never published).
 /tests/sample.records.bin
 /tests/sample.utility.csv
+
+# Optional Java interoperability checks.
+/tests/*.class
