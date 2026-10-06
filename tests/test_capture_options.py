@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -41,6 +42,8 @@ class CaptureOptionsTests(unittest.TestCase):
             self.raw_records.append(bytes(raw))
 
     def capture(self, seconds, **callbacks):
+        self.last_seconds=seconds
+        self.last_capture_options=callbacks
         for index, raw in enumerate(self.raw_records, start=1):
             callbacks["record_callback"](
                 cli.CaptureRecord(index, raw, decode_capture_record(raw))
@@ -59,8 +62,8 @@ class CaptureOptionsTests(unittest.TestCase):
         self.analysis.assert_called_once()
 
     def test_analysis_requires_scope_before_writing_or_opening_device(self):
-        self.assertEqual(self.run_capture("--analyze-transitions"), 2)
-        self.assertIn("requires --scope", self.stderr.getvalue())
+        self.assertEqual(self.run_capture("--no-scope", "--analyze-transitions"), 2)
+        self.assertIn("remove --no-scope", self.stderr.getvalue())
         self.device.assert_not_called()
         self.assertEqual(list(self.prefix.parent.iterdir()), [])
 
@@ -92,7 +95,7 @@ class CaptureOptionsTests(unittest.TestCase):
         self.assertEqual(self.prefix.with_suffix(".scope.xfers.bin").read_bytes(), b"")
 
     def test_hide_goodcrc_preserves_records_and_other_console_output(self):
-        self.assertEqual(self.run_capture(), 0)
+        self.assertEqual(self.run_capture("--show-goodcrc"), 0)
         self.assertIn("GOODCRC", self.stdout.getvalue())
         self.stdout.seek(0)
         self.stdout.truncate()
@@ -114,6 +117,55 @@ class CaptureOptionsTests(unittest.TestCase):
         self.assertEqual(self.run_capture("--quiet", "--hide-goodcrc"), 0)
         self.assertNotIn("REC #", self.stdout.getvalue())
         self.assertNotIn("[status]", self.stdout.getvalue())
+
+    def test_default_capture_is_continuous_with_scope_and_gui_outputs(self):
+        self.assertEqual(self.run_capture(),0)
+        self.assertIsNone(self.last_seconds)
+        self.assertTrue(self.last_capture_options['scope_enabled'])
+        self.assertTrue(self.prefix.with_suffix('.csv').exists())
+        self.assertTrue(self.prefix.with_suffix('.ccgx3').exists())
+        self.assertTrue(self.prefix.with_suffix('.scope.csv').exists())
+        self.assertFalse(self.prefix.with_suffix('.scope.xfers.bin').exists())
+        self.assertNotIn('GOODCRC',self.stdout.getvalue())
+        self.assertIn('ACCEPT',self.stdout.getvalue())
+        self.analysis.assert_not_called()
+
+    def test_explicit_duration_scope_gui_and_display_overrides(self):
+        self.assertEqual(self.run_capture('--seconds','10','--no-scope','--no-ccgx3',
+            '--show-goodcrc','--status-interval','0.5'),0)
+        self.assertEqual(self.last_seconds,10)
+        self.assertFalse(self.last_capture_options['scope_enabled'])
+        self.assertEqual(self.last_capture_options['status_interval_sec'],0.5)
+        self.assertFalse(self.prefix.with_suffix('.scope.csv').exists())
+        self.assertFalse(self.prefix.with_suffix('.ccgx3').exists())
+        self.assertIn('GOODCRC',self.stdout.getvalue())
+
+    def test_default_goodcrc_filter_preserves_error_lines_and_saved_records(self):
+        bad=bytearray(self.raw_records[0]);struct.pack_into('<I',bad,16,(1<<28)|1)
+        self.raw_records.append(bytes(bad))
+        self.assertEqual(self.run_capture(),0)
+        self.assertIn('GOODCRC',self.stdout.getvalue())
+        self.assertIn('IDLE=1',self.stdout.getvalue())
+        self.assertEqual(self.prefix.with_suffix('.records.bin').read_bytes(),b''.join(self.raw_records))
+
+    def test_auto_prefix_creates_separate_timestamped_sessions(self):
+        previous=Path.cwd()
+        try:
+            os.chdir(self.prefix.parent)
+            self.assertEqual(cli.main(['capture']),0)
+            self.assertEqual(cli.main(['capture']),0)
+            files=list(Path('captures').glob('cy4500_*.ccgx3'))
+            self.assertEqual(len(files),2)
+            self.assertTrue(all(path.with_suffix('.csv').exists()for path in files))
+        finally:os.chdir(previous)
+
+    def test_invalid_duration_or_scope_raw_fails_before_usb(self):
+        for flag,value in (('--seconds','0'),('--seconds','nan'),('--status-interval','-1')):
+            with self.assertRaises(SystemExit)as exc:self.run_capture(flag,value)
+            self.assertEqual(exc.exception.code,2)
+        self.assertEqual(self.run_capture('--no-scope','--scope-raw'),2)
+        self.device.assert_not_called()
+        self.assertEqual(list(self.prefix.parent.iterdir()),[])
 
     def test_analysis_outputs_require_force_but_input_capture_can_share_prefix(self):
         self.prefix.with_suffix(".csv").write_text("input", encoding="utf-8")

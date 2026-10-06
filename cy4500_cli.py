@@ -37,6 +37,7 @@ import struct
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -2625,10 +2626,14 @@ def _cmd_export_gui(args) -> int:
 
 
 def _cmd_capture(args) -> int:
+    if args.out_prefix is None:
+        args.out_prefix=str(Path('captures')/('cy4500_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')))
     prefix = Path(args.out_prefix)
 
     if args.analyze_transitions and not args.scope:
-        raise ValueError("--analyze-transitions requires --scope")
+        raise ValueError("--analyze-transitions requires scope; remove --no-scope")
+    if args.scope_raw and not args.scope:
+        raise ValueError("--scope-raw requires scope; remove --no-scope")
     # Reserve the whole session prefix, including optional outputs from a
     # previous capture, before opening files or accessing the analyzer.
     _check_output_paths(
@@ -2720,9 +2725,10 @@ def _cmd_capture(args) -> int:
         jsonl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
         utility_export.write_record(record)
 
-        if not args.quiet and not (
-            args.hide_goodcrc and record.decoded.get("message_name") == "GOODCRC"
-        ):
+        fields=record.decoded["fields"]
+        hidden_goodcrc=(args.hide_goodcrc and record.decoded.get("message_name")=="GOODCRC"
+            and fields["OK"] and not any(fields[name] for name in ("CRC_ERROR","EOP_ERROR","IDLE_ERROR")))
+        if not args.quiet and not hidden_goodcrc:
             print(_compact_record(record))
             for detail in detail_lines:
                 print("    -> " + detail)
@@ -2798,6 +2804,7 @@ def _cmd_capture(args) -> int:
                 transfer_callback=on_transfer,
                 status_callback=on_status,
                 strict_framing=not args.allow_framing_errors,
+                status_interval_sec=args.status_interval,
                 scope_enabled=args.scope,
                 scope_sample_callback=on_scope_sample if args.scope else None,
                 scope_transfer_callback=on_scope_transfer if args.scope else None,
@@ -3026,6 +3033,13 @@ def _add_transition_analysis_options(p) -> None:
         help="plausibility guard around requested target for observed plateau selection (default: 10%%)",
     )
 
+def _positive_capture_value(value):
+    value=float(value)
+    if not math.isfinite(value) or value<=0:
+        raise argparse.ArgumentTypeError('must be finite and greater than zero')
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Direct CY4500-EPR controller/capture utility"
@@ -3138,36 +3152,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="capture EP81 USB-PD records with Utility-format CSV",
         description=("Capture USB-PD records to Utility-format .csv, JSONL and raw files. "
                      "CSV Sno is sequential and Vbus(V) contains integer millivolts. "
-                     "Add --ccgx3 for a GUI session file and --scope to include waveforms."),
+                     "Defaults: until Ctrl+C, timestamped captures/ prefix, scope + ccgx3 enabled, "
+                     "valid GoodCRC hidden only on console. AVS analysis is opt-in."),
     )
 
     duration = p.add_mutually_exclusive_group()
     duration.add_argument(
         "--seconds",
-        type=float,
-        default=8.0,
-        help="capture duration in seconds (default: 8)",
+        type=_positive_capture_value,
+        default=None,
+        help="stop after this many seconds (default: until Ctrl+C)",
     )
     duration.add_argument(
         "--until-ctrl-c",
         action="store_true",
-        help="capture continuously until Ctrl+C",
+        help="capture continuously until Ctrl+C (default)",
     )
 
     p.add_argument(
         "--out-prefix",
-        default="cy4500_capture",
-        help="output path prefix (default: cy4500_capture)",
+        default=None,
+        help="output prefix (default: captures/cy4500_<local date and time>)",
     )
     p.add_argument('--force', action='store_true', help='overwrite existing output files')
-    p.add_argument(
+    scope=p.add_mutually_exclusive_group()
+    scope.add_argument(
         "--scope",
         action="store_true",
         help=(
-            "also capture EP83 scope telemetry in the same START/STOP session; "
+            "capture EP83 scope telemetry in the same START/STOP session (default); "
             "device timestamps are preserved without assuming a common clock"
         ),
     )
+    scope.add_argument('--no-scope',dest='scope',action='store_false',help='disable waveform capture; PD only')
+    p.set_defaults(scope=True)
     p.add_argument(
         "--scope-raw",
         action="store_true",
@@ -3176,14 +3194,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--analyze-transitions",
         action="store_true",
-        help="run EP81+EP83 AVS transition analysis after capture (requires --scope)",
+        help="run EP81+EP83 AVS transition analysis after capture (default: off; requires scope)",
     )
     _add_transition_analysis_options(p)
-    p.add_argument(
+    goodcrc=p.add_mutually_exclusive_group()
+    goodcrc.add_argument(
         "--hide-goodcrc",
         action="store_true",
-        help="suppress GOODCRC console lines while preserving all saved records",
+        help="hide valid GOODCRC console lines (default); all saved records and error lines are preserved",
     )
+    goodcrc.add_argument('--show-goodcrc',dest='hide_goodcrc',action='store_false',help='show GOODCRC console lines')
+    p.set_defaults(hide_goodcrc=True)
     p.add_argument(
         "--quiet",
         action="store_true",
@@ -3196,8 +3217,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument('--gui-csv', action='store_true',
                    help='compatibility alias; Utility CSV is now the default')
-    p.add_argument('--ccgx3', action='store_true',
-                   help='also export Utility 4.2 session ZIP (.ccgx3); includes scope when --scope is used')
+    p.add_argument('--status-interval',type=_positive_capture_value,default=1.0,metavar='SECONDS',
+        help='periodic console status interval (default: 1 second)')
+    gui=p.add_mutually_exclusive_group()
+    gui.add_argument('--ccgx3', action='store_true',
+                   help='export Utility 4.2 session ZIP (.ccgx3), including captured scope (default)')
+    gui.add_argument('--no-ccgx3',dest='ccgx3',action='store_false',help='disable ccgx3 export; CSV/raw files remain saved')
+    p.set_defaults(ccgx3=True)
     p.set_defaults(func=_cmd_capture)
 
     p = sub.add_parser(
@@ -3382,6 +3408,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.command=='capture':args.until_ctrl_c=args.seconds is None
 
     try:
         return int(args.func(args))
