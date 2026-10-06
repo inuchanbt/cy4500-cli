@@ -80,4 +80,25 @@ class UtilityExportTests(unittest.TestCase):
                 graph = z.read(next(n for n in z.namelist() if n.endswith('.scope')))
                 self.assertIn(struct.pack('>HHHQH',65535,123,456,(1<<32)+10,4095), graph)
 
+    def test_reversed_event_and_idle_error_do_not_add_an_epoch(self):
+        rows = UtilityRows()
+        raw = bytearray(64)
+        for start, end, word in [(3322333,3322333,1<<28),
+                                 (3153375,3407777,1<<31),
+                                 (3408885,3410180,1<<31),
+                                 (3410000,3410300,1<<28),
+                                 (3410400,3410900,1<<31)]:
+            struct.pack_into('<III',raw,8,start,end,word)
+            row = rows.row(raw)
+            self.assertEqual(int(row[13]),start)
+            self.assertEqual(int(row[14]),end)
+
+    def test_late_record_from_previous_epoch(self):
+        rows = UtilityRows()
+        raw = bytearray(64)
+        for start, expected in [(0xfffffff0,0xfffffff0), (10,(1<<32)+10),
+                                (0xfffffff8,0xfffffff8), (30,(1<<32)+30)]:
+            struct.pack_into('<III',raw,8,start,(start+5)&0xffffffff,1<<31)
+            self.assertEqual(int(rows.row(raw)[13]),expected)
+
 if __name__ == '__main__': unittest.main()

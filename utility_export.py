@@ -21,17 +21,20 @@ class UtilityRows:
         self.count = 0
         self.previous_start = None
         self.previous_end = None
-        self.epoch = 0
 
     def row(self, raw):
         d = decode_capture_record(raw)
         f = d['fields']
         self.count += 1
         start = d['start_time']
-        if self.previous_start is not None and start < self.previous_start:
-            self.epoch += 1 << 32
-        self.previous_start = start
-        start += self.epoch
+        if self.previous_start is not None:
+            # VOLT events and idle-error packets may precede the prior start.
+            # Select the nearest 32-bit epoch, retaining those real reversals.
+            # Consecutive observations must be less than 2**31 us apart.
+            gap = (start - self.previous_start + (1 << 31)) % (1 << 32) - (1 << 31)
+            start = self.previous_start + gap
+        if self.previous_start is None or start > self.previous_start:
+            self.previous_start = start
         duration = (d['end_time'] - d['start_time']) & 0xffffffff
         end = start + duration
         delta = '' if self.previous_end is None else str(start - self.previous_end)

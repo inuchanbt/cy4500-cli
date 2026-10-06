@@ -233,3 +233,8 @@ These directories are local working material and are not included in a fresh clo
 ## License
 
 [MIT](LICENSE), copyright (c) 2026 inuchanbt.
+
+
+### Timestamp export correction (2026-10-06)
+
+Utility CSV and ccgx3 export now select the nearest 32-bit timestamp epoch rather than adding a full epoch on every backward start time. Voltage events and idle-error records can have an earlier start than the preceding record; those intervals remain visible, including negative Delta values. Actual wraps still unwrap correctly, including delayed records from the previous epoch. The nearest-epoch rule requires adjacent observed timestamps to be less than 2^31 microseconds apart (about 35.8 minutes). Raw records, reported packet duration and scope timestamps are preserved. Paired TI/CY captures `cy_ti_test01` through `03` verified the fix. Original captures were retained; corrected CSV/ccgx3 files, including the original scope samples, are in `captures/comparison/`.
