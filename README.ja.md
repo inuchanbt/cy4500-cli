@@ -20,7 +20,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe cy4500_cli.py version
 ```
 
-`version` は機器ファームウェアのバージョンを読みます。`cy4500_cli.py`、`ezpd_protocol.py`、`utility_export.py` を同じ場所に置いてください。以下の `python` は仮想環境のPythonへ置き換えられます。helpは英語です。
+`version` は機器ファームウェアのバージョンを読みます。`cy4500_cli.py`、`ezpd_protocol.py`、`utility_export.py`、`pd_capture.py` を同じ場所に置いてください。以下の `python` は仮想環境のPythonへ置き換えられます。helpは英語です。
 
 ## 取得
 
@@ -43,7 +43,7 @@ python cy4500_cli.py capture --show-goodcrc
 | 波形 | 有効 | `--no-scope` |
 | 正常GoodCRC表示 | 非表示、全件保存 | `--show-goodcrc` |
 | 状態表示 | 1秒間隔 | `--status-interval N` / `--quiet` |
-| AVS解析 | 無効 | `--analyze-transitions` |
+| PPS/AVS解析 | 無効 | `--analyze-transitions` |
 | EP83 USB生転送の追加保存 | 無効 | `--scope-raw` |
 | 上書き | 無効 | `--force` |
 
@@ -83,7 +83,7 @@ python cy4500_cli.py analyze-sync --pd-csv captures/session01.csv --scope-csv ca
 
 解析には同じ取得セッションのPD/波形CSVを使います。旧CLI/Utility CSVの両形式を受け付け、単位とペイロード表現を解釈します。`--gui-csv` は互換用の何もしないオプションで、CSVを追加しません。
 
-AVS解析は要求、Accept/PS_RDY、波形の動き始め・到達・整定・スルーレートを照合します。要求電圧の±1%に対するAbsと、実測安定電圧の±0.5%に対するObs.Setを分けて表示します。負荷変化で後の安定区間が選ばれる場合があります。USB-PD規格の適合判定ではありません。
+遷移解析はSPR PPS・SPR AVS・EPR AVSの要求、Accept/PS_RDY、波形の動き始め・到達・整定・スルーレートを照合します。要求電圧の±1%に対するAbsと、実測安定電圧の±0.5%に対するObs.Setを分けて表示します。負荷変化で後の安定区間が選ばれる場合があります。USB-PD規格の適合判定ではありません。詳細・一覧CSVに `request_mode`、`request_message`、`object_position` を保存します。エラーパケットやケーブルSOPの応答は照合せず、次の要求・リセット・Reject・Waitを越えて応答を結び付けません。
 
 方向は持続的な実測電圧変化から判断し、逆向きのオーバーシュート回復をランプ速度として扱いません。測定点不足や未解像の値はflagsと空欄で残します。機器時刻は保持し、ホストオフセットや機器間校正は加えません。**EP81のPDとEP83の波形が共通時計であることは未確立**で、異なるストリーム間の時刻比較にはこの制約があります。詳しいしきい値は `capture --help` / `analyze-sync --help` を参照してください。
 
@@ -98,8 +98,10 @@ AVS解析は要求、Accept/PS_RDY、波形の動き始め・到達・整定・�
 .\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
 # 既定は1秒ごとの平均・最小・最大・標準偏差・電圧p-p
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv
-# AVS契約ごとに集計。PS_RDY後の先頭50msを除外
+# SPR PPS / SPR AVS / EPR AVS契約ごとに集計。PS_RDY後の先頭50msを除外
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.csv --group-by request --settle-seconds 0.05
+# SPR PPSだけを集計
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.csv --group-by request --request-mode spr-pps --out captures/session01_pps
 # 固定24V測定、最初の5秒を除外し、0.5秒ごとに集計
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --target-voltage 24 --start 5 --window-seconds 0.5
 # 追加ライブラリなしでCSV・英語レポートを作成
@@ -118,10 +120,11 @@ AVS解析は要求、Accept/PS_RDY、波形の動き始め・到達・整定・�
 | `_voltage_actual.png` / `_current.png` / `_power.png` | 区間平均の時間推移 |
 | `_voltage_pp.png` / `_voltage_pp_vs_voltage.png` | 区間内電圧変動の時間推移 / 実測電圧との関係 |
 | `_voltage_error.png` | 設定電圧が分かる場合の誤差 |
+| `_sweep_voltage_actual/voltage_error/current/power/voltage_pp.png` | 要求電圧を横軸にした統計値。方式・PDO・往路/復路ごとに曲線を分離 |
 
 **電圧p-pは区間内の最大値−最小値で、ASD-PD31のripple値とは測定帯域・方法が異なります。** 遷移・ドリフトも含むため、安定区間を選んで評価してください。不明な電流・設定電圧は空欄とし、負の実測電流はそのまま保持します。集計値はPNGの各点を代表するもので、生波形全点のプロットではありません。
 
-`--group-by request` は同セッションの正常なSOP AVS EPR_REQUEST、Accept、PS_RDYを照合します。連続した同一契約はまとめ、別電圧を経て戻った同じ電圧は別区間として保持します。固定/PPS契約・成立前の区間は除外します。PD CSVが別名の場合は `--pd-csv PATH` で指定できます。`request_current_a` は要求上限電流で、設定負荷電流ではありません。EP81/EP83の共通時計は未確立で、補正は行いません。`live-status` のホスト時刻は要求区間集計には使えません。
+`--group-by request` は**SPR PPS・SPR AVS・EPR AVSすべて**の正常なSOP REQUEST/EPR_REQUEST、Accept、PS_RDYを照合します。通常のREQUESTは直前の正常なSOURCE_CAPABILITIESのPDOと照合するため、能力情報の交換前から取得してください。EPR_REQUESTは内包する選択PDOを使い、SPR PPS/AVSの選択にも対応します。能力情報が不足する要求を推測して解釈しません。連続した同一契約はまとめ、別電圧を経て戻った同じ電圧は別区間として保持します。固定契約・解釈できない要求・成立前の区間は除外します。`--request-mode all|spr-pps|spr-avs|epr-avs` で方式を選べます（既定all）。CSVの `request_mode` / `pdo_object_position` が方式・PDO番号、集計CSVの `sweep_leg` が方式・PDO変更・往復方向による区間を表します。PD CSVが別名の場合は `--pd-csv PATH` で指定できます。`request_current_a` は要求上限電流で、設定負荷電流ではありません。EP81/EP83の共通時計は未確立で、補正は行いません。`live-status` のホスト時刻は要求区間集計には使えません。
 
 レポートは既定で英語です。`--report-lang ja` で日本語の `_human_report.txt`、`--report-lang both` で `_human_report_ja.txt` と `_human_report_en.txt` を作成します。`--no-report` は両言語とも出力しません。
 
@@ -155,6 +158,6 @@ python -m unittest discover -s tests -v
 
 - usb1がない: 起動時と同じPythonでrequirementsをインストール。
 - デバイス未検出・アクセス拒否: USB接続、`04B4:FDEF`のドライバー、GUIによる占有を確認。
-- AVSが見つからない: AVS EPR_REQUESTの前から取得し、同セッションのPD/波形を使用。
+- PPS/AVS要求が見つからない: 同セッションのPD/波形を使用。通常のREQUESTはSOURCE_CAPABILITIES交換前から取得し、EPR_REQUESTは内包する選択PDOを必要とする。
 
 [MIT](LICENSE)、Copyright (c) 2026 inuchanbt。Infineonの公式ソフトウェアではありません。

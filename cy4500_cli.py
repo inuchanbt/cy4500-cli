@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 from utility_export import UtilityExport
+from pd_capture import load_pd_capture_csv
 import statistics
 from collections import Counter
 import json
@@ -93,7 +94,7 @@ try:
         SyncPDSample,
         SyncScopeSample,
         AVSTransitionAnalysis,
-        analyze_avs_transitions,
+        analyze_programmable_transitions,
         TRANSITION_BASELINE_WINDOW_US,
         TRANSITION_BASELINE_GUARD_US,
         TRANSITION_MOVEMENT_MIN_THRESHOLD_V,
@@ -1830,6 +1831,9 @@ TRANSITION_CSV_COLUMNS = (
     "observed_settling_latency_us",
     "observed_average_slew_V_per_s",
     "flags",
+    "request_mode",
+    "request_message",
+    "object_position",
 )
 
 
@@ -1855,44 +1859,7 @@ def _optional_float(value):
 
 
 def _load_pd_capture_csv(path: Path) -> list[SyncPDSample]:
-    rows: list[SyncPDSample] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as fp:
-        reader = csv.DictReader(fp)
-        for row_index, row in enumerate(reader):
-            start_us = _optional_int(row.get("Start Time"))
-            end_us = _optional_int(row.get("End Time"))
-            if start_us is None or end_us is None:
-                continue
-            data_text = (row.get("Data") or "").strip()
-            utility_format = (row.get("Ok") or "").strip() not in ("0", "1")
-            voltage = _optional_float(row.get("Vbus(V)"))
-            try:
-                if utility_format and data_text:
-                    words = data_text.split()
-                    header = int(words[0], 16)
-                    if header & 0x8000:
-                        data = int(words[1], 16).to_bytes(2, 'little')
-                        data += bytes(int(word, 16) for word in words[2:])
-                    else:
-                        data = b''.join(int(word, 16).to_bytes(4, 'little') for word in words[1:])
-                else:
-                    data = bytes.fromhex(data_text) if data_text else b""
-            except (ValueError, IndexError, OverflowError):
-                data = b""
-            if utility_format and voltage is not None:
-                voltage /= 1000
-            rows.append(
-                SyncPDSample(
-                    row_index=row_index,
-                    sno=_optional_int(row.get("Sno")),
-                    message=(row.get("Message") or "").strip(),
-                    start_us=start_us,
-                    end_us=end_us,
-                    vbus_V=voltage,
-                    data=data,
-                )
-            )
-    return rows
+    return load_pd_capture_csv(path)
 
 
 def _load_scope_csv(path: Path) -> list[SyncScopeSample]:
@@ -1930,6 +1897,9 @@ def _transition_row(a: AVSTransitionAnalysis) -> dict[str, object]:
 
 HUMAN_TRANSITION_SUMMARY_COLUMNS = (
     "transition",
+    "request_mode",
+    "request_message",
+    "object_position",
     "request_sno",
     "direction",
     "from_V",
@@ -2020,6 +1990,9 @@ def _human_summary_row(
 
     return {
         "transition": transition_no,
+        "request_mode": a.request_mode,
+        "request_message": a.request_message,
+        "object_position": a.object_position,
         "request_sno": a.request_sno,
         "direction": a.direction,
         "from_V": a.baseline_vbus_V,
@@ -2071,11 +2044,11 @@ def _write_human_transition_summary(
         writer.writerows(rows)
 
     lines = [
-        "CY4500-EPR AVS per-transition summary",
+        "CY4500-EPR PPS/AVS per-transition summary",
         "====================================",
         "",
         (
-            "T#  SNo  Dir    From -> Target   Plateau   Move     PS_RDY   "
+            "T#  SNo  Mode     Dir    From -> Target   Plateau   Move     PS_RDY   "
             "V@PS / Plateau   Obs.Set  PS->Obs   Obs.Slew   Abs"
         ),
         (
@@ -2103,6 +2076,7 @@ def _write_human_transition_summary(
         lines.append(
             f"{row['transition']:>2}  "
             f"{str(row['request_sno']):>3}  "
+            f"{row['request_mode']:<7}  "
             f"{row['direction']:<4}  "
             f"{from_to:<15}  "
             f"{_fmt_num(row['observed_plateau_V'], 3, 'V'):>8}  "
@@ -2119,11 +2093,12 @@ def _write_human_transition_summary(
         [
             "",
             "Column meanings:",
-            "  Move      = EPR_REQUEST -> sustained VBUS movement start",
-            "  PS_RDY    = EPR_REQUEST -> PS_RDY",
+            "  Mode      = SPR_PPS / SPR_AVS / EPR_AVS",
+            "  Move      = REQUEST/EPR_REQUEST -> sustained VBUS movement start",
+            "  PS_RDY    = REQUEST/EPR_REQUEST -> PS_RDY",
             "  V@PS      = EP83 VBUS nearest PS_RDY",
             "  Plateau   = observed final plateau from stable EP83 data",
-            "  Obs.Set   = EPR_REQUEST -> observed-plateau settle",
+            "  Obs.Set   = REQUEST/EPR_REQUEST -> observed-plateau settle",
             "  PS->Obs   = PS_RDY -> observed-plateau settle "
             "(negative means settled before PS_RDY)",
             "  Abs       = requested-target absolute settling result",
@@ -2153,7 +2128,7 @@ def _write_transition_outputs(
             writer.writerow(_transition_row(a))
 
     lines = [
-        "CY4500-EPR synchronized AVS transition analysis",
+        "CY4500-EPR synchronized PPS/AVS transition analysis",
         "==============================================",
         "Clock handling: EP81 and EP83 device timestamps are used as captured;",
         "no host-time offset or fitted clock offset is applied.",
@@ -2170,7 +2145,7 @@ def _write_transition_outputs(
         lines.extend(
             [
                 (
-                    f"[{n}] SNo={a.request_sno} {a.direction} "
+                    f"[{n}] SNo={a.request_sno} {a.request_mode} {a.direction} "
                     f"target={a.target_voltage_V:.3f} V "
                     f"current={a.requested_current_A if a.requested_current_A is not None else 'n/a'} A"
                 ),
@@ -2326,7 +2301,7 @@ def _run_sync_analysis(
         "plateau_target_guard_percent": plateau_target_guard_percent,
     }
 
-    analyses = analyze_avs_transitions(
+    analyses = analyze_programmable_transitions(
         pd_samples,
         scope_samples,
         baseline_window_us=int(round(baseline_window_ms * 1000.0)),
@@ -2363,9 +2338,9 @@ def _run_sync_analysis(
 
 def _print_transition_analysis(analyses: list[AVSTransitionAnalysis]) -> None:
     print()
-    print("AVS TRANSITION ANALYSIS")
+    print("PPS/AVS TRANSITION ANALYSIS")
     if not analyses:
-        print("No AVS EPR_REQUEST transitions found.")
+        print("No SPR PPS / SPR AVS / EPR AVS requests with sufficient PDO context found.")
         return
 
     for a in analyses:
@@ -2402,7 +2377,7 @@ def _print_transition_analysis(analyses: list[AVSTransitionAnalysis]) -> None:
             if a.observed_average_slew_V_per_s is not None else "-"
         )
         print(
-            f"SNo={a.request_sno!s:>3} {a.direction:4s} "
+            f"SNo={a.request_sno!s:>3} {a.request_mode:7s} {a.direction:4s} "
             f"target={a.target_voltage_V:6.3f}V "
             f"move={move:>10} PS_RDY={ps:>10} "
             f"V@PS={ps_v:>9} abs_settle={settle:>10} "
@@ -3098,7 +3073,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "analyze-sync",
-        help="offline EP81 + EP83 AVS transition analysis",
+        help="offline EP81 + EP83 SPR PPS / SPR AVS / EPR AVS transition analysis",
     )
     p.add_argument("--pd-csv", required=True, help="EP81 capture CSV")
     p.add_argument("--scope-csv", required=True, help="EP83 scope CSV")
@@ -3153,7 +3128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=("Capture USB-PD records to Utility-format .csv, JSONL and raw files. "
                      "CSV Sno is sequential and Vbus(V) contains integer millivolts. "
                      "Defaults: until Ctrl+C, timestamped captures/ prefix, scope + ccgx3 enabled, "
-                     "valid GoodCRC hidden only on console. AVS analysis is opt-in."),
+                     "valid GoodCRC hidden only on console. PPS/AVS analysis is opt-in."),
     )
 
     duration = p.add_mutually_exclusive_group()
@@ -3194,7 +3169,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--analyze-transitions",
         action="store_true",
-        help="run EP81+EP83 AVS transition analysis after capture (default: off; requires scope)",
+        help="run EP81+EP83 PPS/AVS transition analysis after capture (default: off; requires scope)",
     )
     _add_transition_analysis_options(p)
     goodcrc=p.add_mutually_exclusive_group()

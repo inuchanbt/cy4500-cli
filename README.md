@@ -4,7 +4,7 @@ English | [日本語](README.ja.md)
 
 A Python command-line controller and capture tool for the **Infineon/Cypress CY4500-EPR USB-PD analyzer**.
 
-Capture USB Power Delivery traffic, record voltage/current telemetry, configure hardware triggers, and analyze EPR Adjustable Voltage Supply (AVS) transitions from saved measurements.
+Capture USB Power Delivery traffic, record voltage/current telemetry, configure hardware triggers, and analyze SPR PPS, SPR AVS and EPR AVS transitions from saved measurements.
 
 The current implementation comes from the v13 controller and v10 protocol definitions. The maintained files are now `cy4500_cli.py` and `ezpd_protocol.py`; revisions are tracked in Git.
 
@@ -16,7 +16,7 @@ The current implementation comes from the v13 controller and v10 protocol defini
 - Read live voltage/current status using command `0x11`.
 - Configure SOM/EOM/MTR hardware triggers and arm the measurement engine.
 - Configure CC1/CC2 terminations explicitly.
-- Analyze AVS requests, ACCEPT/PS_RDY timing, voltage movement, and settling from saved PD/scope CSV files.
+- Analyze SPR PPS / SPR AVS / EPR AVS requests, ACCEPT/PS_RDY timing, voltage movement, and settling from saved PD/scope CSV files.
 - Summarize scope/live CSV measurements into statistics, PNG plots and Japanese/English reports with `analyze_sweep_csv.py`.
 
 ## Offline sweep/waveform summaries
@@ -29,6 +29,7 @@ scope CSV and `live-status --csv` output. Passing a PD CSV loads its sibling
 .\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.csv --group-by request --settle-seconds 0.05
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.csv --group-by request --request-mode spr-pps --out captures/session01_pps
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --no-plots
 .\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --report-lang ja --out captures/session01_ja
 ```
@@ -49,13 +50,30 @@ anchored to the first input sample. Settling time exclusion is applied before
 sample exclusion. Unknown measurements/targets remain blank; signed current
 is retained. Plots show segment statistics rather than every raw sample.
 
-Request grouping uses successful SOP AVS EPR_REQUEST / ACCEPT / PS_RDY
-contracts. Repeated identical contracts share a segment; a return to an earlier
-voltage remains separate. Unsupported contracts and unestablished intervals
-are excluded. Use `--pd-csv PATH` if the same-session PD file has another name.
+Request grouping covers **SPR PPS, SPR AVS and EPR AVS**, using successful SOP
+REQUEST/EPR_REQUEST / ACCEPT / PS_RDY contracts. Ordinary REQUEST RDOs are
+resolved against the latest valid SOURCE_CAPABILITIES table; EPR_REQUEST uses its
+embedded selected PDO, including selections of SPR PPS/AVS. Start recording before capability exchange
+to provide context for SPR requests. Missing capability context is not guessed.
+Repeated identical contracts share a segment; a return to an earlier voltage
+remains separate. Fixed/unsupported contracts and unestablished intervals are
+excluded. Use `--pd-csv PATH` if the same-session PD file has another name.
+`--request-mode all|spr-pps|spr-avs|epr-avs` selects families (default: all).
+Summary/normalized CSVs include `request_mode` and `pdo_object_position`.
+Summary `sweep_leg` separates families, PDO changes and voltage reversals.
+Additional `_sweep_voltage_actual.png`, `_sweep_voltage_error.png`,
+`_sweep_current.png`, `_sweep_power.png` and `_sweep_voltage_pp.png` plot statistics
+against **requested voltage**, with separate curves for each family and sweep leg.
 Request current is a PD current limit, not a load-current setpoint. EP81/EP83
 clock alignment is unestablished; no offset correction is applied. Live-status
 host timestamps cannot be used for request grouping.
+
+`cy4500_cli.py analyze-sync` and `capture --analyze-transitions` also cover all
+three families. Detailed and human transition CSVs include `request_mode`,
+`request_message` and `object_position`. Invalid packets and cable-SOP traffic
+cannot supply capabilities or responses; matching ends at any new request,
+reset, reject or wait. The historical `analyze_avs_transitions` Python API is
+retained as an alias for `analyze_programmable_transitions`.
 
 **Voltage peak-to-peak is the maximum minus minimum in a segment. It includes
 transitions and drift and is not directly comparable to ASD-PD31 ripple.**
@@ -101,7 +119,7 @@ Record a 10-second session with raw EP83 transfers:
 
 Capture now runs until Ctrl+C by default, with scope and ccgx3 enabled. Omit `--out-prefix` for a timestamped `captures/cy4500_YYYYMMDD_HHMMSS_ffffff` prefix in local time. Valid GOODCRC console lines are hidden by default, while all packets are saved and error lines remain visible. Use `--show-goodcrc` to display them. `--hide-goodcrc`, `--scope`, `--ccgx3`, and `--until-ctrl-c` still explicitly select the default behavior.
 
-AVS transition analysis is off by default. Add `--analyze-transitions` to run it after capture. Use `--no-scope` for PD-only capture and `--no-ccgx3` to omit the GUI archive. `--status-interval N` changes the default 1-second status interval. Raw EP83 transfer output (`--scope-raw`) and overwriting (`--force`) remain off by default. Analysis and raw scope output cannot be combined with `--no-scope`.
+PPS/AVS transition analysis is off by default. Add `--analyze-transitions` to run it after capture. Use `--no-scope` for PD-only capture and `--no-ccgx3` to omit the GUI archive. `--status-interval N` changes the default 1-second status interval. Raw EP83 transfer output (`--scope-raw`) and overwriting (`--force`) remain off by default. Analysis and raw scope output cannot be combined with `--no-scope`.
 
 | Setting | Default | Override |
 | --- | --- | --- |
@@ -111,7 +129,7 @@ AVS transition analysis is off by default. Add `--analyze-transitions` to run it
 | Scope | On | `--no-scope` |
 | Valid GoodCRC console lines | Hidden; all saved | `--show-goodcrc` |
 | Status | Every 1 second | `--status-interval N` / `--quiet` |
-| AVS analysis | Off | `--analyze-transitions` |
+| PPS/AVS analysis | Off | `--analyze-transitions` |
 | Raw EP83 USB transfers | Off | `--scope-raw` |
 | Overwrite | Off | `--force` |
 
@@ -173,7 +191,7 @@ Scope mode drains EP81 while recording EP83. Use `capture --scope` when you also
 
 ### Analyze a saved session
 
-Re-run AVS analysis without opening the analyzer:
+Re-run PPS/AVS analysis without opening the analyzer:
 
 ```powershell
 .\.venv\Scripts\python.exe cy4500_cli.py analyze-sync --pd-csv captures/session01.csv --scope-csv captures/session01.scope.csv --out-prefix captures/session01_analysis
@@ -257,7 +275,7 @@ For `--out-prefix captures/session01`, the following suffixes are added to `capt
 | `.summary.txt` | Semantic session summary and capture clock metadata | `capture` |
 | `.scope.csv` | Decoded EP83 samples | `capture --scope` |
 | `.scope.xfers.bin` | Length-prefixed raw EP83 transfers | `capture --scope --scope-raw` |
-| `.transitions.csv` / `.transitions.txt` | Detailed AVS transition analysis | `capture --scope --analyze-transitions`, or `analyze-sync` |
+| `.transitions.csv` / `.transitions.txt` | Detailed SPR PPS / SPR AVS / EPR AVS transition analysis | `capture --scope --analyze-transitions`, or `analyze-sync` |
 | `.transition_summary.csv` / `.transition_summary.txt` | Compact per-transition summary | `capture --scope --analyze-transitions`, or `analyze-sync` |
 
 PD CSV uses UTF-8 and the Utility format. Scope and analysis CSV files use UTF-8 with a BOM. PD end times reflect the actual captured end time.
@@ -267,7 +285,9 @@ PD CSV uses UTF-8 and the Utility format. Scope and analysis CSV files use UTF-8
 ```text
 cy4500-cli/
 ├── cy4500_cli.py       # Command-line interface and device/capture control
-├── ezpd_protocol.py    # Protocol definitions, decoders, and AVS analysis
+├── ezpd_protocol.py    # Protocol definitions, decoders, and PPS/AVS analysis
+├── pd_capture.py       # Shared Utility/legacy CSV reader; no USB dependency
+├── analyze_sweep_csv.py # Offline CSV statistics, plots and reports
 ├── utility_export.py  # Utility CSV/ccgx3 serialization
 ├── requirements.txt   # Python dependencies
 ├── tests/             # Synthetic regression and optional Java checks
@@ -297,9 +317,9 @@ These directories are local working material and are not included in a fresh clo
 ## Troubleshooting
 
 - **`python-libusb1 is required`**: install `requirements.txt` with the same Python executable used to launch the CLI.
-- **`ezpd_protocol.py must be in the same directory or on PYTHONPATH`**: keep cy4500_cli.py, ezpd_protocol.py and utility_export.py together.
+- **`ezpd_protocol.py must be in the same directory or on PYTHONPATH`**: keep cy4500_cli.py, ezpd_protocol.py, utility_export.py and pd_capture.py together.
 - **Device not found or access denied**: check the USB connection, the `04B4:FDEF` device/interface driver, and whether another analyzer application has the device open.
-- **No AVS transitions found**: verify that the capture includes AVS EPR_REQUEST traffic and use PD/scope CSV files from the same session. A recording started after the relevant negotiation may lack the needed context.
+- **No programmable transitions found**: use PD/scope CSV files from the same session. Ordinary REQUEST needs SOURCE_CAPABILITIES beforehand; EPR_REQUEST needs its embedded selected PDO. A recording started after capability exchange may lack the context for ordinary requests.
 
 ## License
 

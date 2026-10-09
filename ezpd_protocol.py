@@ -923,7 +923,7 @@ def scope_graph_preamble(first_sample: ScopeSample) -> tuple[ScopeGraphPoint, Sc
     )
 
 
-# EP81 + EP83 synchronized AVS transition analysis --------------------------
+# EP81 + EP83 synchronized PPS/AVS transition analysis ----------------------
 
 TRANSITION_BASELINE_WINDOW_US = 100_000
 TRANSITION_BASELINE_GUARD_US = 5_000
@@ -952,6 +952,78 @@ class SyncPDSample:
     end_us: int
     vbus_V: Optional[float]
     data: bytes
+    ok: bool = True
+    sop: str = "SOP"
+
+
+PD_RESET_MESSAGES = {"HARD_RESET", "HARD RESET", "SOFT_RESET", "DETACH", "EPR_MODE"}
+
+
+def is_pd_session_reset(packet: SyncPDSample) -> bool:
+    """Hardware reset/detach events need not carry an ordinary SOP marker."""
+    if not packet.ok:
+        return False
+    return (packet.sop in {"HARD_RESET", "HARD RESET"}
+            or packet.message in {"HARD_RESET", "HARD RESET", "DETACH"}
+            or (packet.sop == "SOP" and packet.message in PD_RESET_MESSAGES))
+
+
+@dataclass(frozen=True)
+class ProgrammableRequest:
+    mode: str
+    target_voltage_V: float
+    requested_current_A: Optional[float]
+    object_position: int
+
+
+class PDRequestTracker:
+    """Resolve SPR Request RDOs against the latest valid SOP Source PDO table.
+
+    EPR requests carry their selected PDO. No request is guessed from RDO
+    bits alone. Reset/detach and malformed capability tables discard context.
+    """
+
+    def __init__(self):
+        self.source_pdos: list[dict[str, object]] = []
+
+    def observe(self, packet: SyncPDSample) -> Optional[ProgrammableRequest]:
+        if is_pd_session_reset(packet):
+            self.source_pdos = []
+            return None
+        if not packet.ok or packet.sop != "SOP":
+            return None
+        message = packet.message
+        if message == "SOURCE_CAPABILITIES":
+            self.source_pdos = []
+            if 4 <= len(packet.data) <= 28 and len(packet.data) % 4 == 0:
+                self.source_pdos = decode_source_capabilities_payload(packet.data)
+            return None
+        if message not in {"REQUEST", "EPR_REQUEST"}:
+            return None
+        if len(packet.data) < 4:
+            return None
+        raw = int.from_bytes(packet.data[:4], "little")
+        position = (raw >> 28) & 0xF
+        if message == "EPR_REQUEST":
+            if len(packet.data) != 8 or not 1 <= position <= 11:
+                return None
+            selected = decode_pdo(int.from_bytes(packet.data[4:8], "little"), position=position)
+            mode = {"PPS": "SPR_PPS", "SPR_AVS": "SPR_AVS", "AVS": "EPR_AVS"}.get(selected.get("apdo_name"))
+            if mode is None or (position >= 8) != (mode == "EPR_AVS"):
+                return None
+        else:
+            if len(packet.data) != 4 or not 1 <= position <= len(self.source_pdos):
+                return None
+            selected = self.source_pdos[position - 1]
+            mode = {"PPS": "SPR_PPS", "SPR_AVS": "SPR_AVS"}.get(selected.get("apdo_name"))
+            if mode is None:
+                return None
+        request = decode_rdo(raw, selected_pdo=selected)
+        target = request.get("requested_voltage_V")
+        current = request.get("operating_current_A")
+        if target is None or float(target) <= 0:
+            return None
+        return ProgrammableRequest(mode, float(target), None if current is None else float(current), position)
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1076,9 @@ class AVSTransitionAnalysis:
     observed_settling_latency_us: Optional[int]
     observed_average_slew_V_per_s: Optional[float]
     flags: tuple[str, ...]
+    request_mode: str = "EPR_AVS"
+    request_message: str = "EPR_REQUEST"
+    object_position: Optional[int] = None
 
 
 def _median(values: Sequence[float]) -> float:
@@ -1042,32 +1117,7 @@ def _nearest_scope_sample(
     return min(choices, key=lambda s: abs(s.timestamp_us - timestamp_us))
 
 
-def _decode_avs_request_from_pd_sample(
-    pd: SyncPDSample,
-) -> Optional[tuple[float, Optional[float]]]:
-    """
-    Decode an EPR_REQUEST only when its second 32-bit object identifies an AVS
-    APDO. Analyzer capture CSV stores the logical message bytes in Data, i.e.
-    RDO first, selected Source PDO second for the tested EPR_REQUEST form.
-    """
-    if pd.message != "EPR_REQUEST" or len(pd.data) < 8:
-        return None
-
-    rdo_raw = int.from_bytes(pd.data[0:4], "little")
-    pdo_raw = int.from_bytes(pd.data[4:8], "little")
-    pdo = decode_pdo(pdo_raw, position=(rdo_raw >> 28) & 0xF)
-    if pdo.get("apdo_name") != "AVS":
-        return None
-
-    rdo = decode_rdo(rdo_raw, selected_pdo=pdo)
-    target = rdo.get("requested_voltage_V")
-    current = rdo.get("operating_current_A")
-    if target is None:
-        return None
-    return float(target), (None if current is None else float(current))
-
-
-def analyze_avs_transitions(
+def analyze_programmable_transitions(
     pd_samples: Sequence[SyncPDSample],
     scope_samples: Sequence[SyncScopeSample],
     *,
@@ -1088,17 +1138,18 @@ def analyze_avs_transitions(
     plateau_target_guard_fraction: float = TRANSITION_PLATEAU_TARGET_GUARD_FRACTION,
 ) -> list[AVSTransitionAnalysis]:
     """
-    Correlate EP81 EPR_REQUEST/ACCEPT/PS_RDY messages with EP83 telemetry.
+    Correlate SPR PPS / SPR AVS / EPR AVS requests with EP83 telemetry.
 
     No host-time offset is estimated or applied. Both streams are compared on
     the raw/unwrapped device microsecond timestamps exactly as captured.
 
     Matching:
-      - For each AVS EPR_REQUEST, walk forward in EP81 order.
+      - Resolve each programmable request against the source capabilities.
+      - Only valid SOP packets participate in matching.
       - ACCEPT is the first ACCEPT after the request and before the next
-        EPR_REQUEST.
+        REQUEST/EPR_REQUEST or session reset.
       - PS_RDY is the first PS_RDY after that ACCEPT (or request if ACCEPT is
-        absent) and before the next EPR_REQUEST.
+        absent) and before the next REQUEST/EPR_REQUEST or session reset.
 
     Movement detection:
       - baseline = median EP83 VBUS in [request-baseline_window,
@@ -1134,24 +1185,36 @@ def analyze_avs_transitions(
     pd_rows = list(pd_samples)
     scope = sorted(scope_samples, key=lambda s: s.timestamp_us)
     results: list[AVSTransitionAnalysis] = []
+    tracker = PDRequestTracker()
+    decoded_requests = [tracker.observe(packet) for packet in pd_rows]
 
     for i, req in enumerate(pd_rows):
-        decoded_req = _decode_avs_request_from_pd_sample(req)
+        decoded_req = decoded_requests[i]
         if decoded_req is None:
             continue
 
-        target_v, requested_current = decoded_req
+        target_v = decoded_req.target_voltage_V
+        requested_current = decoded_req.requested_current_A
 
         next_req_index = len(pd_rows)
         for k in range(i + 1, len(pd_rows)):
-            if pd_rows[k].message == "EPR_REQUEST":
+            boundary = pd_rows[k]
+            if (is_pd_session_reset(boundary) or
+                    (boundary.ok and boundary.sop == "SOP" and boundary.message in {"REQUEST", "EPR_REQUEST"})):
                 next_req_index = k
                 break
 
         accept = None
         ps_rdy = None
+        response_flags = []
         for k in range(i + 1, next_req_index):
             candidate = pd_rows[k]
+            if not candidate.ok or candidate.sop != "SOP":
+                continue
+            if candidate.message in {"REJECT", "WAIT"}:
+                response_flags.append("request_" + candidate.message.lower())
+                next_req_index = k
+                break
             if accept is None and candidate.message == "ACCEPT":
                 accept = candidate
                 continue
@@ -1174,7 +1237,11 @@ def analyze_avs_transitions(
             if baseline_start <= s.timestamp_us <= baseline_end
         ]
 
-        flags: list[str] = []
+        flags: list[str] = list(response_flags)
+        if accept is None:
+            flags.append("accept_not_observed")
+        if ps_rdy is None:
+            flags.append("ps_rdy_not_observed")
 
         if baseline_samples:
             baseline_v = _median(baseline_samples)
@@ -1212,6 +1279,9 @@ def analyze_avs_transitions(
             s for s in scope
             if req.start_us <= s.timestamp_us < search_end_us
         ]
+        if response_flags:
+            # A rejected/waiting request did not establish the target contract.
+            post_scope = []
 
         movement_start = None
         movement_sample = None
@@ -1500,6 +1570,9 @@ def analyze_avs_transitions(
 
         results.append(
             AVSTransitionAnalysis(
+                request_mode=decoded_req.mode,
+                request_message=req.message,
+                object_position=decoded_req.object_position,
                 request_row_index=req.row_index,
                 request_sno=req.sno,
                 direction=direction,
@@ -1590,6 +1663,10 @@ def analyze_avs_transitions(
         )
 
     return results
+
+
+# Retain the historical API for callers; it now covers all three APDO families.
+analyze_avs_transitions = analyze_programmable_transitions
 
 def vbus_epr_volts(raw: int) -> float:
     """

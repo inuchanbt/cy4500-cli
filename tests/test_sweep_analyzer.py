@@ -121,7 +121,7 @@ class SweepAnalyzerTests(unittest.TestCase):
         self.assertEqual([r["samples"] for r in summary], ["2", "2", "2"])
         self.assertEqual(summary[0]["current_mean"], "")
         report = (self.folder / "avs.scope_analysis_human_report.txt").read_text(encoding="utf-8")
-        self.assertIn("Successful AVS Accept / PS_RDY contracts", report)
+        self.assertIn("Successful SPR PPS / SPR AVS / EPR AVS Accept / PS_RDY contracts", report)
         self.assertIn("without clock correction", report)
         self.assertIn("not a load-current setpoint", report)
         self.assertNotIn("Current: mean", report)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_right
+from collections import Counter
 import csv
 from dataclasses import dataclass
 import math
@@ -15,7 +16,7 @@ from pathlib import Path
 import statistics
 import sys
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 @dataclass
@@ -31,6 +32,8 @@ class Sample:
     segment: int = 0
     target: float | None = None
     request_current: float | None = None
+    request_mode: str | None = None
+    object_position: int | None = None
 
 
 def number(value):
@@ -89,53 +92,33 @@ def resolve_input(path: Path):
     return path, pd_path
 
 
-def request_events(path: Path):
-    """Successful SOP AVS contracts; unsupported contracts invalidate AVS state.
+def request_events(path: Path, include_metadata=False):
+    """Successful SPR PPS / SPR AVS / EPR AVS contracts, without clock fitting.
 
-    Time counters are used as exported, without inventing stream alignment.
-    Consecutive identical AVS contracts do not restart a measurement segment.
+    Repeated identical contracts share one segment. Missing source PDO context
+    and unsupported contracts invalidate the active programmable contract.
     """
-    from ezpd_protocol import decode_epr_request_payload
+    from ezpd_protocol import PDRequestTracker, is_pd_session_reset
+    from pd_capture import load_pd_capture_csv
 
-    packets = []
-    with path.open(encoding="utf-8-sig", newline="") as fp:
-        reader = csv.DictReader(fp)
-        if not {"Message", "Start Time", "Data", "Ok", "SOP"} <= set(reader.fieldnames or []):
-            raise ValueError("--pd-csv はCY4500のPD通信CSVを指定してください。")
-        for row in reader:
-            stamp = number(row.get("Start Time"))
-            if stamp is not None:
-                packets.append((stamp, row))
-    packets.sort(key=lambda item: item[0])
+    tracker = PDRequestTracker()
     pending = None
     accepted = False
     active = None
     events = []
-    for stamp, row in packets:
-        message = (row.get("Message") or "").strip().upper()
-        ok = (row.get("Ok") or "").strip().upper()
-        if ok == "DETACH" or message in {"HARD_RESET", "HARD RESET"}:
+    for packet in load_pd_capture_csv(path):
+        decoded = tracker.observe(packet)
+        stamp, message = packet.start_us, packet.message
+        if is_pd_session_reset(packet):
             pending, accepted, active = None, False, None
-            events.append((stamp, None, None))
+            events.append((stamp, None, None, None, None))
             continue
-        if ok not in {"OK", "1"} or (row.get("SOP") or "").strip().upper() != "SOP":
+        if not packet.ok or packet.sop != "SOP":
             continue
         if message in {"REQUEST", "EPR_REQUEST"}:
-            pending, accepted = (None, None), False
-            if message == "EPR_REQUEST":
-                try:
-                    text = (row.get("Data") or "").strip()
-                    if ok == "1":  # Legacy CLI: little-endian payload bytes.
-                        payload = bytes.fromhex(text)
-                    else:  # Utility export: PD header followed by object words.
-                        payload = b"".join(int(word, 16).to_bytes(4, "little") for word in text.split()[1:])
-                    decoded = decode_epr_request_payload(payload)
-                    selected = decoded.get("selected_pdo") or {}
-                    request = decoded.get("rdo") or {}
-                    if selected.get("apdo_name") == "AVS":
-                        pending = (request.get("requested_voltage_V"), request.get("operating_current_A"))
-                except (ValueError, OverflowError):
-                    pass
+            pending = ((None, None, None, None) if decoded is None else
+                       (decoded.target_voltage_V, decoded.requested_current_A, decoded.mode, decoded.object_position))
+            accepted = False
         elif message == "ACCEPT" and pending is not None:
             accepted = True
         elif message == "PS_RDY" and pending is not None and accepted:
@@ -145,10 +128,8 @@ def request_events(path: Path):
             pending, accepted = None, False
         elif message in {"REJECT", "WAIT"}:
             pending, accepted = None, False
-        elif message in {"SOFT_RESET", "EPR_MODE"}:
-            pending, accepted, active = None, False, None
-            events.append((stamp, None, None))
-    return events
+    events.sort(key=lambda event: event[0])
+    return events if include_metadata else [event[:3] for event in events]
 
 
 def group_samples(samples, args, events):
@@ -163,7 +144,13 @@ def group_samples(samples, args, events):
             event_index = bisect_right(event_times, sample.time_us) - 1
             if event_index < 0 or events[event_index][1] is None:
                 continue
-            stamp, sample.target, sample.request_current = events[event_index]
+            event = events[event_index]
+            stamp, sample.target, sample.request_current = event[:3]
+            if len(event) > 3:
+                sample.request_mode, sample.object_position = event[3:5]
+            request_mode = getattr(args, "request_mode", "all")
+            if request_mode != "all" and sample.request_mode != request_mode.upper().replace("-", "_"):
+                continue
             sample.segment = event_index + 1
             since_start = (sample.time_us - stamp) / 1_000_000
         else:
@@ -183,7 +170,9 @@ def group_samples(samples, args, events):
         row = {"segment": segment, "elapsed_s": group[0].elapsed,
                "end_elapsed_s": group[-1].elapsed, "samples": len(group),
                "target_voltage_v": group[0].target,
-               "request_current_a": group[0].request_current}
+               "request_current_a": group[0].request_current,
+               "request_mode": group[0].request_mode,
+               "pdo_object_position": group[0].object_position}
         for name, attribute in (("voltage", "voltage"), ("current", "current"),
                                 ("power", "power"), ("cc1", "cc1"), ("cc2", "cc2")):
             values = [value for sample in group if (value := getattr(sample, attribute)) is not None]
@@ -197,6 +186,20 @@ def group_samples(samples, args, events):
         summaries.append(row)
     if not summaries:
         raise ValueError("条件に合う測定区間がありません。時刻範囲・settle・min-samples・PD要求を確認してください。")
+    leg, direction, previous = 0, 0, None
+    for row in summaries:
+        identity = (row["request_mode"], row["pdo_object_position"])
+        if previous is None or identity != (previous["request_mode"], previous["pdo_object_position"]):
+            leg, direction = leg + 1, 0
+        elif row["target_voltage_v"] is not None and previous["target_voltage_v"] is not None:
+            delta = row["target_voltage_v"] - previous["target_voltage_v"]
+            sign = 1 if delta > 0 else -1 if delta < 0 else 0
+            if sign and direction and sign != direction:
+                leg += 1
+            if sign:
+                direction = sign
+        row["sweep_leg"] = leg
+        previous = row
     return kept, summaries
 
 
@@ -211,6 +214,7 @@ def normalized_rows(samples):
     return [{"source_row": s.row, "timestamp_us": s.time_us, "elapsed_s": s.elapsed,
              "segment": s.segment, "target_voltage_v": s.target,
              "request_current_a": s.request_current, "actual_voltage_v": s.voltage,
+             "request_mode": s.request_mode, "pdo_object_position": s.object_position,
              "actual_current_a": s.current, "actual_power_w": s.power,
              "cc1_v": s.cc1, "cc2_v": s.cc2} for s in samples]
 
@@ -220,7 +224,7 @@ def human_report(path, kind, all_samples, kept, summaries, skipped, args, langua
         return en if language == "en" else ja
 
     gaps = [b.time_us - a.time_us for a, b in zip(all_samples, all_samples[1:]) if b.time_us > a.time_us]
-    grouping = (tr("AVSのAccept / PS_RDY成立ごと", "Successful AVS Accept / PS_RDY contracts")
+    grouping = (tr("SPR PPS / SPR AVS / EPR AVSのAccept / PS_RDY成立ごと", "Successful SPR PPS / SPR AVS / EPR AVS Accept / PS_RDY contracts")
                 if args.group_by == "request" else tr(f"{args.window_seconds}秒の時間窓", f"{args.window_seconds}-second time windows"))
     lines = [tr("CY4500 CSV かんたんレポート", "CY4500 CSV Measurement Report"), "=" * 46,
              tr(f"入力ファイル: {path}", f"Input file: {path}"),
@@ -263,10 +267,12 @@ def human_report(path, kind, all_samples, kept, summaries, skipped, args, langua
         lines += [tr("設定電圧が不明のため、電圧誤差は空欄です。固定電圧測定では --target-voltage で指定できます。",
                      "Voltage error is blank because the target voltage is unknown. Use --target-voltage for a known fixed target.")]
     if args.group_by == "request":
-        lines += ["", tr("要求区間はAVS契約のPS_RDYから次の契約変更までです。遷移の後半を含む場合があります。",
-                         "Request segments run from an AVS contract's PS_RDY to the next contract change. They may include the end of a transition."),
-                  tr("固定/PPSなどAVS以外の契約区間・成立前の区間は除外します。",
-                     "Non-AVS contracts (including fixed/PPS) and intervals before contract establishment are excluded."),
+        counts = Counter(row["request_mode"] for row in summaries)
+        lines += ["", tr("方式別の集計区間数: ", "Segments by request mode: ") + ", ".join(f"{mode}={count}" for mode, count in sorted(counts.items())),
+                  tr("要求区間はPPS/AVS契約のPS_RDYから次の契約変更までです。遷移を含む場合があります。",
+                     "Request segments run from a PPS/AVS contract's PS_RDY to the next contract change. They may include transitions."),
+                  tr("固定契約・能力情報不足で解釈できない要求・成立前の区間は除外します。",
+                     "Fixed contracts, requests without sufficient capability context, and intervals before contract establishment are excluded."),
                   tr("EP81とEP83の共通時計は未確立です。取得時刻をそのまま照合し、時計補正は行いません。",
                      "A shared EP81/EP83 clock has not been established. Captured timestamps are compared as exported, without clock correction."),
                   tr("request_current_aはPD要求の電流上限で、設定負荷電流ではありません。",
@@ -277,6 +283,9 @@ def human_report(path, kind, all_samples, kept, summaries, skipped, args, langua
               tr("*_voltage_actual/current/power/voltage_pp.png: 区間ごとの時間推移", "*_voltage_actual/current/power/voltage_pp.png: segment statistics over time"),
               tr("*_voltage_error.png: 設定電圧が分かる場合の誤差", "*_voltage_error.png: error when the target voltage is known"),
               tr("*_voltage_pp_vs_voltage.png: 実測電圧に対する区間内電圧p-p", "*_voltage_pp_vs_voltage.png: segment voltage peak-to-peak versus measured voltage")]
+    if args.group_by == "request":
+        lines += [tr("*_sweep_*.png: 要求電圧に対する統計値（方式・往路/復路を分離）",
+                     "*_sweep_*.png: statistics versus requested voltage, separating modes and outbound/return legs")]
     if args.no_plots:
         lines += [tr("今回は --no-plots のためPNGは作成していません。", "PNG files were not generated because --no-plots was specified.")]
     return "\n".join(lines) + "\n"
@@ -291,6 +300,25 @@ PLOTS = [("voltage_mean", "voltage_actual", "Voltage (V)"),
 
 def plot_specs(summaries):
     return [(col, suffix, label) for col, suffix, label in PLOTS if any(row[col] is not None for row in summaries)]
+
+
+def sweep_plot_specs(summaries):
+    return plot_specs(summaries) if any(row["request_mode"] is not None for row in summaries) else []
+
+
+def sweep_series(summaries):
+    """Retain chronology and share the turnaround point between return legs."""
+    curves = []
+    for row in summaries:
+        if not curves or curves[-1][-1]["sweep_leg"] != row["sweep_leg"]:
+            curve = []
+            if curves:
+                previous = curves[-1][-1]
+                if (previous["request_mode"], previous["pdo_object_position"]) == (row["request_mode"], row["pdo_object_position"]):
+                    curve.append(previous)
+            curves.append(curve)
+        curves[-1].append(row)
+    return curves
 
 
 def generate_plots(summaries, prefix, plt):
@@ -312,6 +340,18 @@ def generate_plots(summaries, prefix, plt):
     fig.tight_layout()
     fig.savefig(f"{prefix}_voltage_pp_vs_voltage.png", dpi=150)
     plt.close(fig)
+    for col, suffix, label in sweep_plot_specs(summaries):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for curve in sweep_series(summaries):
+            last = curve[-1]
+            ax.plot([row["target_voltage_v"] for row in curve], [row[col] for row in curve], ".-",
+                    label=f"{last['request_mode']} / PDO {last['pdo_object_position']} / leg {last['sweep_leg']}")
+        ax.set(xlabel="Requested voltage (V)", ylabel=label, title="CY4500 sweep: " + label)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize="small")
+        fig.tight_layout()
+        fig.savefig(f"{prefix}_sweep_{suffix}.png", dpi=150)
+        plt.close(fig)
 
 
 def main(argv=None):
@@ -321,7 +361,9 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, help="Output prefix (default: input stem + _analysis)")
     parser.add_argument("--group-by", choices=("time", "request"), default="time")
     parser.add_argument("--window-seconds", type=float, default=1.0)
-    parser.add_argument("--pd-csv", type=Path, help="Same-session PD CSV for --group-by request (AVS only)")
+    parser.add_argument("--pd-csv", type=Path, help="Same-session PD CSV for SPR PPS / SPR AVS / EPR AVS request grouping")
+    parser.add_argument("--request-mode", choices=("all", "spr-pps", "spr-avs", "epr-avs"), default="all",
+                        help="Filter request-grouped segments by APDO family (default: all)")
     parser.add_argument("--target-voltage", type=float, help="Known fixed target voltage; time grouping only")
     parser.add_argument("--settle-seconds", type=float, default=0.0, help="Exclude first N seconds of each window/contract")
     parser.add_argument("--discard-first", type=int, default=0, help="Then exclude first N samples per window/contract")
@@ -349,6 +391,8 @@ def main(argv=None):
         parser.error("--target-voltage requires --group-by time")
     if args.group_by == "time" and args.pd_csv is not None:
         parser.error("--pd-csv requires --group-by request")
+    if args.group_by != "request" and args.request_mode != "all":
+        parser.error("--request-mode requires --group-by request")
     try:
         source, sibling_pd = resolve_input(args.csv)
         samples, kind, skipped = load_samples(source)
@@ -359,7 +403,7 @@ def main(argv=None):
             pd_path = args.pd_csv or sibling_pd
             if pd_path is None or not pd_path.is_file():
                 raise ValueError("--group-by request には同セッションの --pd-csv が必要です。")
-            events = request_events(pd_path)
+            events = request_events(pd_path, include_metadata=True)
         kept, summaries = group_samples(samples, args, events)
         prefix = args.out or source.with_name(source.stem + "_analysis")
         outputs = [Path(f"{prefix}_normalized.csv"), Path(f"{prefix}_summary.csv")]
@@ -379,6 +423,7 @@ def main(argv=None):
             except ImportError as exc:
                 raise ValueError("PNG作成にはmatplotlibが必要です: python -m pip install -r requirements-analysis.txt（CSVのみなら --no-plots）") from exc
             outputs += [Path(f"{prefix}_{suffix}.png") for _, suffix, _ in plot_specs(summaries)]
+            outputs += [Path(f"{prefix}_sweep_{suffix}.png") for _, suffix, _ in sweep_plot_specs(summaries)]
             outputs.append(Path(f"{prefix}_voltage_pp_vs_voltage.png"))
         input_paths = {args.csv.resolve(), source.resolve()}
         if args.pd_csv or sibling_pd:
