@@ -1,0 +1,2 @@
+# Optional PNG plots for analyze_sweep_csv.py. CSV/report analysis uses stdlib.
+matplotlib>=3.7,<4

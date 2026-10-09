@@ -89,6 +89,42 @@ AVS解析は要求、Accept/PS_RDY、波形の動き始め・到達・整定・�
 
 同時測定のAVS往復では正常PD 1,622件とAVS67要求の全Accept/PS_RDYがTIと一致しました。波形はCY 163,035点、TI 9,016点で、同じPCの解析本体は約23.54秒/0.67秒。密度と安定区間の反復探索が速度差に寄与します。データの間引きは行いません。[TI側の比較レポート](https://github.com/inuchanbt/TI-PD-ANALYZER-CLI/tree/main/docs/reports)に詳細を記録しています。元測定ファイルは公開リポジトリに含めません。
 
+## 波形CSVの集計・グラフ
+
+`analyze_sweep_csv.py` はASD-PD31の解析スクリプトと同様に、正規化CSV、集計CSV、PNG、日本語・英語レポートを作成します。USB接続は不要です。CY4500の `.scope.csv` と `live-status --csv` の出力を受け付けます。PDの `.csv` を渡すと、同名の `.scope.csv` を読みます。
+
+```powershell
+# PNG用の追加ライブラリ（CSV・テキストだけなら不要）
+.\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
+# 既定は1秒ごとの平均・最小・最大・標準偏差・電圧p-p
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv
+# AVS契約ごとに集計。PS_RDY後の先頭50msを除外
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.csv --group-by request --settle-seconds 0.05
+# 固定24V測定、最初の5秒を除外し、0.5秒ごとに集計
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --target-voltage 24 --start 5 --window-seconds 0.5
+# 追加ライブラリなしでCSV・英語レポートを作成
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --no-plots
+# 日本語レポート（英語版と保存先を分ける例）
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --report-lang ja --out captures/session01_ja
+```
+
+既定の出力prefixは入力波形ファイルのstemに `_analysis` を付けたものです。`--out PREFIX` で変更できます。既存出力の上書きには `--force` が必要です。`--end` は先頭サンプルからの経過秒（指定時刻を除外）、`--discard-first N` は各区間の先頭Nサンプル除外、`--min-samples N` は集計に必要な最低点数（既定2）です。`--settle-seconds` による時間除外の後に `--discard-first` を適用します。時間窓の境界は入力先頭が基準で、`--start` では移動しません。
+
+| 出力suffix | 内容 |
+| --- | --- |
+| `_normalized.csv` | 解析に使った全サンプル。電圧V・電流A・電力W・時刻µs/経過秒 |
+| `_summary.csv` | 区間ごとのサンプル数、平均・最小・最大・母標準偏差、電圧p-p、既知の設定電圧に対する誤差 |
+| `_human_report.txt` | 測定範囲・サンプル間隔・実測値・電圧変動の説明（既定は英語、`--report-lang ja` で日本語） |
+| `_voltage_actual.png` / `_current.png` / `_power.png` | 区間平均の時間推移 |
+| `_voltage_pp.png` / `_voltage_pp_vs_voltage.png` | 区間内電圧変動の時間推移 / 実測電圧との関係 |
+| `_voltage_error.png` | 設定電圧が分かる場合の誤差 |
+
+**電圧p-pは区間内の最大値−最小値で、ASD-PD31のripple値とは測定帯域・方法が異なります。** 遷移・ドリフトも含むため、安定区間を選んで評価してください。不明な電流・設定電圧は空欄とし、負の実測電流はそのまま保持します。集計値はPNGの各点を代表するもので、生波形全点のプロットではありません。
+
+`--group-by request` は同セッションの正常なSOP AVS EPR_REQUEST、Accept、PS_RDYを照合します。連続した同一契約はまとめ、別電圧を経て戻った同じ電圧は別区間として保持します。固定/PPS契約・成立前の区間は除外します。PD CSVが別名の場合は `--pd-csv PATH` で指定できます。`request_current_a` は要求上限電流で、設定負荷電流ではありません。EP81/EP83の共通時計は未確立で、補正は行いません。`live-status` のホスト時刻は要求区間集計には使えません。
+
+レポートは既定で英語です。`--report-lang ja` で日本語の `_human_report.txt`、`--report-lang both` で `_human_report_ja.txt` と `_human_report_en.txt` を作成します。`--no-report` は両言語とも出力しません。
+
 ## その他のコマンド
 
 | コマンド | 用途 |

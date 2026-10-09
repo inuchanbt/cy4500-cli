@@ -17,6 +17,49 @@ The current implementation comes from the v13 controller and v10 protocol defini
 - Configure SOM/EOM/MTR hardware triggers and arm the measurement engine.
 - Configure CC1/CC2 terminations explicitly.
 - Analyze AVS requests, ACCEPT/PS_RDY timing, voltage movement, and settling from saved PD/scope CSV files.
+- Summarize scope/live CSV measurements into statistics, PNG plots and Japanese/English reports with `analyze_sweep_csv.py`.
+
+## Offline sweep/waveform summaries
+
+`analyze_sweep_csv.py` provides an ASD-PD31-style analysis workflow for CY4500
+scope CSV and `live-status --csv` output. Passing a PD CSV loads its sibling
+`.scope.csv`. It does not open hardware.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.csv --group-by request --settle-seconds 0.05
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --no-plots
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/session01.scope.csv --report-lang ja --out captures/session01_ja
+```
+
+The default groups samples into one-second windows. Outputs use the waveform
+stem plus `_analysis`: `_normalized.csv`, `_summary.csv`, `_human_report.txt`,
+and PNG plots for voltage, current, power and voltage peak-to-peak. CSV/report
+analysis uses only the Python standard library; matplotlib is optional for PNGs.
+Use `--out PREFIX` to change the prefix; existing outputs require `--force`.
+Reports default to English. `--report-lang ja` writes a Japanese
+`_human_report.txt`; `--report-lang both` writes `_human_report_ja.txt` and
+`_human_report_en.txt`. `--no-report` suppresses reports in either language.
+
+Options include `--window-seconds`, `--start`/`--end` (seconds from the first
+sample, end exclusive), `--discard-first` (per segment), `--min-samples`
+(default 2), and `--target-voltage` for a known fixed target. Time windows stay
+anchored to the first input sample. Settling time exclusion is applied before
+sample exclusion. Unknown measurements/targets remain blank; signed current
+is retained. Plots show segment statistics rather than every raw sample.
+
+Request grouping uses successful SOP AVS EPR_REQUEST / ACCEPT / PS_RDY
+contracts. Repeated identical contracts share a segment; a return to an earlier
+voltage remains separate. Unsupported contracts and unestablished intervals
+are excluded. Use `--pd-csv PATH` if the same-session PD file has another name.
+Request current is a PD current limit, not a load-current setpoint. EP81/EP83
+clock alignment is unestablished; no offset correction is applied. Live-status
+host timestamps cannot be used for request grouping.
+
+**Voltage peak-to-peak is the maximum minus minimum in a segment. It includes
+transitions and drift and is not directly comparable to ASD-PD31 ripple.**
+Select steady intervals for evaluation. The report also records sample gaps.
 
 ## Requirements
 
